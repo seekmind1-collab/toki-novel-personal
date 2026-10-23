@@ -6,7 +6,7 @@ const mangayomiSources = [{
   iconUrl: "https://dc-toki-mangayomi-novel.pages.dev/icon/ko.toki-novel.png",
   typeSource: "single",
   itemType: 2,
-  version: "0.3.2",
+  version: "0.3.3",
   dateFormat: "",
   dateFormatLocale: "ko_KR",
   pkgPath: "novel/src/ko/toki31_novel.js",
@@ -646,7 +646,7 @@ class DefaultExtension extends MProvider {
   async _rankList(page) {
     // Use the HTML list the site currently serves; keep the old rank parser.
     try {
-      const current = await this.loadLegacyList(page, { status: "all", sort: "views" }, "");
+      const current = await this.loadLegacyList(page, { status: "all", sort: "new" }, "");
       if (current.list.length) return current;
     } catch (htmlError) {
       try { return await this._rankOld(page); }
@@ -721,6 +721,129 @@ class DefaultExtension extends MProvider {
     return String(date.valueOf());
   }
 
+  async _legacyDetail(doc, html, base, target) {
+    const metadata = {};
+    const pairPattern = /<span[^>]*theme-detail-info-label[^>]*>\s*([^<]+)\s*<\/span>\s*<span[^>]*theme-detail-info-value[^>]*>([\s\S]*?)<\/span>/gi;
+    let pair;
+    while ((pair = pairPattern.exec(this._text(html))) !== null) {
+      metadata[this.cleanText(pair[1])] = this.cleanText(pair[2].replace(/<[^>]*>/g, " "));
+    }
+    const meta = (property) => this._text(doc.selectFirst('meta[property="' + property + '"]')?.attr("content")).trim();
+    const name = this.cleanText(
+      this.firstText(doc, ".hero-v2-title") ||
+      this.firstText(doc, ".theme-detail-title-line") ||
+      this.firstText(doc, ".novel-detail .nd-info h1") ||
+      meta("og:title").replace(/\s+-\s+뉴토끼[\s\S]*$/i, "")
+    );
+    if (!name) throw new Error("NOVEL_DETAIL_TITLE_MISSING: detail HTML did not contain a recognizable novel title");
+    const author = this.cleanText(
+      this.firstText(doc, ".hero-v2-author a") ||
+      metadata["작가"] ||
+      this.firstText(doc, ".nd-meta span a")
+    );
+    const description = this.cleanText(
+      this.firstText(doc, ".hero-v2-desc") ||
+      this.firstText(doc, ".theme-detail-description") ||
+      this.firstText(doc, ".nd-desc") ||
+      meta("og:description")
+    );
+    const genre = doc.select(".hero-v2-tag").map((item) => this.cleanText(item.text)).filter(Boolean);
+    if (!genre.length && metadata["장르"]) genre.push(...metadata["장르"].split(/\s*,\s*/).filter(Boolean));
+    const coverNode = doc.selectFirst(".hero-v2-thumb img") || doc.selectFirst(".view-img img") || doc.selectFirst(".nd-thumb img");
+    const coverRaw = this._text(coverNode?.getSrc || coverNode?.attr("data-src") || coverNode?.attr("src") || meta("og:image"));
+    const imageUrl = coverRaw ? this.absoluteUrl(base, coverRaw) : this.generatedCover(name);
+    const statusText = this.firstText(doc, ".pill-status") || metadata["발행구분"] || "";
+    const status = /완결/.test(statusText) ? 1 : 0;
+    let rows = doc.select("#serial-move ul.list-body li.list-item");
+    if (!rows.length) rows = doc.select("ul.list-body li.list-item");
+    if (!rows.length) rows = doc.select(".novel-ep-row");
+    const chapters = [];
+    const seen = new Set();
+    const workId = this._text(target.match(/\/novel\/(\d+)/)?.[1]);
+    for (const row of rows) {
+      const anchor = row.selectFirst("a.item-subject") || row.selectFirst("a.novel-ep-link");
+      const rawLink = this._text(anchor?.getHref || anchor?.attr("href")).trim();
+      if (!rawLink) continue;
+      const url = this.siteUrl(base, rawLink);
+      const parts = url.match(/\/novel\/(\d+)\/(\d+)(?:[?#]|$)/);
+      if (!parts || (workId && parts[1] !== workId) || seen.has(url)) continue;
+      seen.add(url);
+      const title = this.cleanText(this.firstText(row, "a.item-subject") || this.firstText(row, ".ne-title"));
+      const numberText = this.cleanText(this.firstText(row, ".ne-num") || row.attr("data-ep") || "");
+      const numberMatch = numberText.match(/(\d+)\s*(?:화|회)?/);
+      const number = numberMatch ? numberMatch[1] + "화" : "";
+      const chapterName = number && !new RegExp("^\\s*" + numberMatch[1] + "\\s*화").test(title)
+        ? number + (title ? " - " + title : "")
+        : (title || number || "회차 " + parts[2]);
+      const paid = this.hasElement(row, ".ep-price-badge, .ep-badge-paid, .ne-unlock-cost") || this.isPaidGate(anchor?.attr("data-novel-episode-gate"));
+      chapters.push({
+        name: paid ? chapterName + " 🔒" : chapterName,
+        url,
+        dateUpload: this.parseDate(this.firstText(row, ".wr-date") || this.firstText(row, ".ne-date")),
+        scanlator: paid ? "🔒" : null
+      });
+    }
+    if (!chapters.length) {
+      throw new Error("NOVEL_DETAIL_CHAPTERS_MISSING: detail loaded, but no episode links matched the page layout");
+    }
+    const novelId = workId;
+    const res = { body: html };
+    const client = new Client({ timeout: 45 });
+    // The new site server-renders only the newest 100 episodes. Older
+    // episodes are exposed through a cursor API, so follow the same windows
+    // the website's "이전 회차 더 보기" button uses.
+    if (novelId && chapters.length > 0) {
+      const lastRow = doc.select(".novel-ep-row").slice(-1)[0];
+      const lastNumber = Number(lastRow?.attr("data-ep") || 0);
+      const lastId = String(lastRow?.attr("data-episode-id") || "");
+      let cursor = lastNumber > 0 && lastId ? `${lastNumber}:${lastId}` : null;
+      let hasOlder = Boolean(cursor) && /(?:\\"|")hasOlder(?:\\"|")\s*:\s*true/.test(res.body);
+      let windows = 0;
+
+      while (hasOlder && cursor && windows < 150) {
+        const apiUrl = `${base}/api/novel/${encodeURIComponent(novelId)}/episodes/window?direction=older&cursor=${encodeURIComponent(cursor)}`;
+        const windowRes = await client.get(apiUrl, {
+          ...this.getHeaders(apiUrl, target),
+          Accept: "application/json",
+          Referer: target
+        });
+        if (windowRes.statusCode !== 200) break;
+
+        let data;
+        try {
+          data = JSON.parse(windowRes.body);
+        } catch (_) {
+          break;
+        }
+        if (!data?.ok || !Array.isArray(data.items)) break;
+
+        for (const item of data.items) {
+          const episodeId = String(item?.id || "");
+          if (!episodeId || chapterIds.has(episodeId)) continue;
+          chapterIds.add(episodeId);
+          const number = this.cleanText(item.episodeLabel || (item.number ? `${item.number}\uD654` : "\uD68C\uCC28"));
+          const title = this.cleanText(item.title || "");
+          const markers = [
+            this.isTrueFlag(item.isNotReady) ? "\u23F3 \uC900\uBE44\uC911" : "",
+            this.isTrueFlag(item.isPaid) || this.isPaidGate(item.gateMode) ? "\uD83D\uDD12 \uC720\uB8CC" : ""
+          ].filter(Boolean).join(" ");
+          chapters.push({
+            name: `${markers ? markers + " \u00B7 " : ""}${title ? `${number} - ${title}` : number}`,
+            url: `${base}/novel/${novelId}/${episodeId}`,
+            dateUpload: this.parseDate(item.publishedAtLabel),
+            scanlator: null
+          });
+        }
+
+        hasOlder = this.isTrueFlag(data.hasOlder);
+        cursor = typeof data.olderCursor === "string" ? data.olderCursor : null;
+        windows += 1;
+      }
+    }
+
+    return { name, link: target, imageUrl, description, genre, author, artist: author, status, chapters };
+  }
+
   async getDetail(url) {
     const cardMatch = this._text(url).match(/\/__toki_novel_card__\/([\w-]+)/);
     if (cardMatch) {
@@ -763,6 +886,10 @@ class DefaultExtension extends MProvider {
     const res = await client.get(target, this.getHeaders(target, `${base}/novel`));
     const doc = new Document(res.body);
     const root = doc.selectFirst(".novel-detail");
+    // The new domain may serve the Legacy template instead of novel-detail.
+    if (!root || !this.firstText(root, ".nd-info h1") || !doc.select(".novel-ep-row").length) {
+      return await this._legacyDetail(doc, res.body, base, target);
+    }
     const name = this.firstText(root, ".nd-info h1");
     const description = this.firstText(root, ".nd-desc");
     const author = this.firstText(root, ".nd-meta span a");
