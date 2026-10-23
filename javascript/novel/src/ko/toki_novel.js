@@ -6,7 +6,7 @@ const mangayomiSources = [{
   iconUrl: "https://dc-toki-mangayomi-novel.pages.dev/icon/ko.toki-novel.png",
   typeSource: "single",
   itemType: 2,
-  version: "0.3.5",
+  version: "0.3.6",
   dateFormat: "",
   dateFormatLocale: "ko_KR",
   pkgPath: "novel/src/ko/toki31_novel.js",
@@ -721,13 +721,97 @@ class DefaultExtension extends MProvider {
     return String(date.valueOf());
   }
 
+  _paginationNotice(description, chapters) {
+    const trace = this._novelPagingTrace;
+    if (!trace || chapters.length < 70 || chapters.length > 120 || trace.added > 0) return description;
+    return this._text(description) +
+      "\n\n[확장 진단 v0.3.6] 회차 " + chapters.length +
+      "개 / 회차번호 " + (trace.cursor ? "발견" : "없음") +
+      " / 이전회차 API " + trace.api +
+      " / 상세페이지 2번 " + trace.page +
+      ". 추가 회차가 없으면 이 문구를 캡처해 주세요.";
+  }
+
+  async _appendPagedDetailChapters(doc, base, target, novelId, chapters, client, trace) {
+    // Fallback only: some legacy HTML detail pages expose an ordinary
+    // page-numbered episode list instead of the cursor endpoint.
+    if (!doc.select("#serial-move ul.list-body li.list-item").length &&
+        !doc.select("ul.list-body li.list-item").length) {
+      trace.page = "지원 형식 아님";
+      return;
+    }
+    const known = new Set(chapters.map(ch => this._text(ch.url || ch.link)));
+    const canonical = target.split("?")[0];
+    const nav = doc.select("#serial-move a[href], .pagination a[href], .pg_wrap a[href]");
+    const next = nav.map(a => this._text(a.getHref || a.attr("href")))
+      .find(href => /[?&]page=2(?:&|$)/.test(href) &&
+        !/^(?:https?:)?\/\//.test(href));
+    const firstUrl = next ? this.siteUrl(base, next) : canonical + "?page=2";
+    let firstFetched = false;
+    for (let page = 2; page <= 25; page++) {
+      const url = page === 2 ? firstUrl : canonical + "?page=" + page;
+      if (!url.startsWith(base + "/novel/" + novelId + "?") &&
+          url !== canonical + "?page=" + page) {
+        trace.page = "주소 형식 불일치";
+        break;
+      }
+      trace.page = "요청";
+      let paged;
+      try {
+        const response = await client.get(url, this.getHeaders(url, target));
+        if (Number(response.statusCode) !== 200) {
+          trace.page = "HTTP " + response.statusCode;
+          break;
+        }
+        firstFetched = true;
+        paged = new Document(this._text(response.body));
+      } catch (_) {
+        trace.page = "연결/분석 오류";
+        break;
+      }
+      let rows = paged.select("#serial-move ul.list-body li.list-item");
+      if (!rows.length) rows = paged.select("ul.list-body li.list-item");
+      if (!rows.length) {
+        trace.page = "회차 목록 없음";
+        break;
+      }
+      let added = 0;
+      for (const row of rows) {
+        const a = row.selectFirst("a.item-subject");
+        const href = this._text(a?.getHref || a?.attr("href"));
+        const link = this.siteUrl(base, href);
+        const m = link.match(/\/novel\/(\d+)\/(\d+)(?:[?#]|$)/);
+        if (!m || m[1] !== String(novelId) || known.has(link)) continue;
+        const name = this.cleanText(this.firstText(row, "a.item-subject"));
+        if (!name) continue;
+        known.add(link);
+        added += 1;
+        chapters.push({
+          name,
+          url: link,
+          dateUpload: this.parseDate(this.firstText(row, ".wr-date")),
+          scanlator: this.hasElement(row, ".ep-price-badge") ? "🔒" : null
+        });
+      }
+      trace.added += added;
+      trace.page = added ? "추가 " + trace.added + "개" : "새 회차 0개";
+      if (!added) break;
+    }
+    if (!firstFetched && trace.page === "요청") trace.page = "응답 없음";
+  }
+
   async _appendOlderChapterWindows(doc, base, target, novelId, chapters, client) {
     // Both detail templates can contain only the latest episode window.
     // Pick the oldest numbered episode visible in either template.
     let rows = doc.select(".novel-ep-row");
     if (!rows.length) rows = doc.select("#serial-move ul.list-body li.list-item");
     if (!rows.length) rows = doc.select("ul.list-body li.list-item");
-    if (!novelId || !chapters.length || !rows.length) return;
+    const trace = { cursor: false, api: "미요청", page: "미요청", added: 0 };
+    this._novelPagingTrace = trace;
+    if (!novelId || !chapters.length || !rows.length) {
+      trace.page = "회차 목록 없음";
+      return;
+    }
 
     let oldest = null;
     for (const row of rows) {
@@ -755,7 +839,11 @@ class DefaultExtension extends MProvider {
         oldest = { number: episodeNumber, id: episodeId };
       }
     }
-    if (!oldest) return;
+    if (!oldest) {
+      await this._appendPagedDetailChapters(doc, base, target, novelId, chapters, client, trace);
+      return;
+    }
+    trace.cursor = true;
 
     const knownEpisodeIds = new Set();
     for (const chapter of chapters) {
@@ -764,6 +852,7 @@ class DefaultExtension extends MProvider {
       if (match && match[1] === String(novelId)) knownEpisodeIds.add(match[2]);
     }
 
+    const beforeApiCount = chapters.length;
     let cursor = oldest.number + ":" + oldest.id;
     const requestedCursors = new Set();
     for (let windowCount = 0; windowCount < 150; windowCount++) {
@@ -772,15 +861,20 @@ class DefaultExtension extends MProvider {
       const apiUrl = base + "/api/novel/" + encodeURIComponent(novelId) +
         "/episodes/window?direction=older&cursor=" + encodeURIComponent(cursor);
       let data;
+      trace.api = "요청";
       try {
         const response = await client.get(apiUrl, {
           ...this.getHeaders(apiUrl, target),
           Accept: "application/json",
           Referer: target
         });
-        if (Number(response.statusCode) !== 200) break;
+        if (Number(response.statusCode) !== 200) {
+          trace.api = "HTTP " + response.statusCode;
+          break;
+        }
+        trace.api = "HTTP 200";
         data = JSON.parse(this._text(response.body));
-      } catch (_) { break; }
+      } catch (_) { trace.api = "연결/JSON 오류"; break; }
       if (!data || data.ok !== true || !Array.isArray(data.items) ||
           data.items.length === 0) break;
 
@@ -790,6 +884,7 @@ class DefaultExtension extends MProvider {
         if (!/^\d+$/.test(id) || knownEpisodeIds.has(id)) continue;
         knownEpisodeIds.add(id);
         added += 1;
+        trace.added += 1;
         const number = this.cleanText(item.episodeLabel ||
           (item.number ? item.number + "화" : "회차"));
         const title = this.cleanText(item.title || "");
@@ -811,6 +906,9 @@ class DefaultExtension extends MProvider {
       if (!this.isTrueFlag(data.hasOlder) || !nextCursor ||
           nextCursor === cursor || !added) break;
       cursor = nextCursor;
+    }
+    if (chapters.length === beforeApiCount) {
+      await this._appendPagedDetailChapters(doc, base, target, novelId, chapters, client, trace);
     }
   }
 
@@ -884,7 +982,7 @@ class DefaultExtension extends MProvider {
     const client = new Client({ timeout: 45 });
     await this._appendOlderChapterWindows(doc, base, target, novelId, chapters, client);
 
-    return { name, link: target, imageUrl, description, genre, author, artist: author, status, chapters };
+    return { name, link: target, imageUrl, description: this._paginationNotice(description, chapters), genre, author, artist: author, status, chapters };
   }
 
   async getDetail(url) {
@@ -974,7 +1072,7 @@ class DefaultExtension extends MProvider {
       name,
       link: target,
       imageUrl,
-      description,
+      description: this._paginationNotice(description, chapters),
       genre,
       author,
       artist: author,
