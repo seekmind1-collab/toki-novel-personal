@@ -6,7 +6,7 @@ const mangayomiSources = [{
   iconUrl: "https://dc-toki-mangayomi-novel.pages.dev/icon/ko.toki-novel.png",
   typeSource: "single",
   itemType: 2,
-  version: "0.3.1",
+  version: "0.3.2",
   dateFormat: "",
   dateFormatLocale: "ko_KR",
   pkgPath: "novel/src/ko/toki31_novel.js",
@@ -323,6 +323,19 @@ class DefaultExtension extends MProvider {
   }
 
   async loadApiList(page, criteria, query) {
+    // The newer site renders novel cards as HTML, unlike the original JSON API.
+    // Preserve the original API implementation as a fallback.
+    try {
+      const legacy = await this.loadLegacyList(page, criteria, query);
+      if (legacy.list.length || this._text(query).trim()) return legacy;
+    } catch (htmlError) {
+      try { return await this.loadModernApiList(page, criteria, query); }
+      catch (_) { throw htmlError; }
+    }
+    return this.loadModernApiList(page, criteria, query);
+  }
+
+  async loadModernApiList(page, criteria, query) {
     const base = await this._resolveBaseUrl();
     const current = Math.max(1, Number(page) || 1);
     const params = [
@@ -343,6 +356,53 @@ class DefaultExtension extends MProvider {
       list: novels.map((item) => this.novelFromApi(base, item)),
       hasNextPage: novels.length >= this.pageSize
     };
+  }
+
+  legacyListFromDocument(doc, base, page) {
+    const list = [];
+    const seen = new Set();
+    const rows = doc.select("#webtoon-list-all > li");
+    for (const row of rows) {
+      const name = this.cleanText(this.firstText(row, "span.title.white") || this.firstText(row, ".title.white"));
+      const linkNode = row.selectFirst(".img-item > a") || row.selectFirst("a[href*='/novel/']");
+      const rawLink = this._text(linkNode?.getHref || linkNode?.attr("href"));
+      if (!name || !/\/novel\/\d+/.test(rawLink)) continue;
+      const link = this.siteUrl(base, rawLink);
+      if (seen.has(link)) continue;
+      seen.add(link);
+      const cover = row.selectFirst("img.theme-thumb-img");
+      const coverPath = this._text(cover?.getSrc || cover?.attr("data-src") || cover?.attr("src"));
+      list.push({ name, link, imageUrl: coverPath ? this.absoluteUrl(base, coverPath) : this.generatedCover(name) });
+    }
+    // Also accept the newer card layout if the destination has switched themes.
+    if (!list.length) list.push(...this.listFromDocument(doc, base));
+    const explicitlyEmpty = this.hasElement(doc, ".list-wrap .wr-none");
+    if (!list.length && !explicitlyEmpty) {
+      throw new Error("NOVEL_LIST_STRUCTURE_MISSING: the HTML did not contain recognizable novel cards");
+    }
+    const nextPage = Math.max(1, Number(page) || 1) + 1;
+    const hasNextPage = doc.select(".pagination-desktop a, .pagination a").some((anchor) => {
+      const href = this._text(anchor.getHref || anchor.attr("href")).replace(/&amp;/g, "&");
+      return new RegExp("[?&]page=" + nextPage + "(?:&|$)").test(href);
+    });
+    return { list, hasNextPage: hasNextPage || list.length >= this.pageSize };
+  }
+
+  async loadLegacyList(page, criteria, query) {
+    const base = await this._resolveBaseUrl();
+    const selected = criteria || {};
+    const current = Math.max(1, Number(page) || 1);
+    const sortNames = { new: "as_update", fresh: "as_new", hot: "as_bookmark", views: "as_view", rating: "as_rating", episodes: "as_episode" };
+    const genres = { fantasy: "판타지", wuxia: "무협", adult19: "19금", modern: "현대", romance: "로맨스", romance_fantasy: "로맨스 판타지", bl: "BL", light_novel: "라노벨", etc: "기타" };
+    const params = ["kind=novel", "page=" + current, "pub=" + encodeURIComponent(query ? "all" : (selected.status || "ongoing")), "sod=desc", "sst=" + encodeURIComponent(sortNames[selected.sort] || "as_update")];
+    if (query) params.push("stx=" + encodeURIComponent(query));
+    else {
+      if (selected.genre) params.push("tag=" + encodeURIComponent(genres[selected.genre] || selected.genre));
+      if (selected.platform) params.push("plat=" + encodeURIComponent(selected.platform));
+    }
+    const target = base + "/novel?" + params.join("&");
+    const body = await this._requestText(target, base + "/novel", 30);
+    return this.legacyListFromDocument(new Document(body), base, current);
   }
 
   _driveDirect(url, image) {
@@ -520,7 +580,11 @@ class DefaultExtension extends MProvider {
 
   async _prependCard(result, page, tab) {
     if (Number(page) !== 1) return result;
-    return { list: [await this._tabCard(tab)].concat(result.list || []), hasNextPage: result.hasNextPage === true };
+    try {
+      return { list: [await this._tabCard(tab)].concat(result.list || []), hasNextPage: result.hasNextPage === true };
+    } catch (_) {
+      return result; // Optional promotional card must not hide the novel list.
+    }
   }
 
   _defaultPopularRule() {
@@ -580,6 +644,18 @@ class DefaultExtension extends MProvider {
   }
 
   async _rankList(page) {
+    // Use the HTML list the site currently serves; keep the old rank parser.
+    try {
+      const current = await this.loadLegacyList(page, { status: "all", sort: "views" }, "");
+      if (current.list.length) return current;
+    } catch (htmlError) {
+      try { return await this._rankOld(page); }
+      catch (_) { throw htmlError; }
+    }
+    return this._rankOld(page);
+  }
+
+  async _rankOld(page) {
     if (Number(page) > 1) return { list: [], hasNextPage: false };
     const base = await this._resolveBaseUrl();
     const target = `${base}/rank?kind=novel`;
