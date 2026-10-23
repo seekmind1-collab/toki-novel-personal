@@ -6,7 +6,7 @@ const mangayomiSources = [{
   iconUrl: "https://dc-toki-mangayomi-novel.pages.dev/icon/ko.toki-novel.png",
   typeSource: "single",
   itemType: 2,
-  version: "0.3.3",
+  version: "0.3.4",
   dateFormat: "",
   dateFormatLocale: "ko_KR",
   pkgPath: "novel/src/ko/toki31_novel.js",
@@ -721,6 +721,85 @@ class DefaultExtension extends MProvider {
     return String(date.valueOf());
   }
 
+  async _appendOlderChapterWindows(doc, base, target, novelId, chapters, client) {
+    // The page commonly renders only the newest 100 chapters.
+    // Determine the cursor from the final server-rendered episode row.
+    // Do not gate the initial request on a literal "hasOlder" in the HTML:
+    // that marker is optional and can be encoded differently.
+    const rows = doc.select(".novel-ep-row");
+    if (!novelId || !chapters.length || !rows.length) return;
+
+    const last = rows[rows.length - 1];
+    const epLabel = this._text(last?.attr("data-ep")) ||
+      this.cleanText(this.firstText(last, ".ne-num"));
+    const epMatch = epLabel.match(/\d+/);
+    const episodeNumber = epMatch ? Number(epMatch[0]) : 0;
+    let episodeId = this._text(last?.attr("data-episode-id")).trim();
+    if (!episodeId) {
+      const anchor = last?.selectFirst("a.novel-ep-link");
+      const href = this._text(anchor?.getHref || anchor?.attr("href"));
+      const match = href.match(/\/novel\/(\d+)\/(\d+)(?:[?#]|$)/);
+      if (match && match[1] === String(novelId)) episodeId = match[2];
+    }
+    if (!Number.isSafeInteger(episodeNumber) || episodeNumber < 1 ||
+        !/^\d+$/.test(episodeId)) return;
+
+    const knownEpisodeIds = new Set();
+    for (const chapter of chapters) {
+      const match = this._text(chapter.url || chapter.link).match(/\/novel\/(\d+)\/(\d+)(?:[?#]|$)/);
+      if (match && match[1] === String(novelId)) knownEpisodeIds.add(match[2]);
+    }
+
+    let cursor = episodeNumber + ":" + episodeId;
+    const requestedCursors = new Set();
+    for (let windowCount = 0; windowCount < 150; windowCount += 1) {
+      if (requestedCursors.has(cursor)) break;
+      requestedCursors.add(cursor);
+      const apiUrl = base + "/api/novel/" + encodeURIComponent(novelId) +
+        "/episodes/window?direction=older&cursor=" + encodeURIComponent(cursor);
+      let data;
+      try {
+        const response = await client.get(apiUrl, {
+          ...this.getHeaders(apiUrl, target),
+          Accept: "application/json",
+          Referer: target
+        });
+        if (Number(response.statusCode) !== 200) break;
+        data = JSON.parse(this._text(response.body));
+      } catch (_) { break; }
+      if (!data || data.ok !== true || !Array.isArray(data.items) ||
+          data.items.length === 0) break;
+
+      let added = 0;
+      for (const item of data.items) {
+        const id = this._text(item?.id).trim();
+        if (!/^\d+$/.test(id) || knownEpisodeIds.has(id)) continue;
+        knownEpisodeIds.add(id);
+        added += 1;
+        const number = this.cleanText(item.episodeLabel ||
+          (item.number ? item.number + "화" : "회차"));
+        const title = this.cleanText(item.title || "");
+        const notReady = this.isTrueFlag(item.isNotReady);
+        const paid = this.isTrueFlag(item.isPaid) || this.isPaidGate(item.gateMode);
+        const markers = [notReady ? "⏳ 준비중" : "", paid ? "🔒 유료" : ""]
+          .filter(Boolean).join(" ");
+        chapters.push({
+          name: (markers ? markers + " · " : "") +
+            (title ? number + " - " + title : number),
+          url: base + "/novel/" + novelId + "/" + id,
+          dateUpload: this.parseDate(item.publishedAtLabel),
+          scanlator: null
+        });
+      }
+
+      const nextCursor = typeof data.olderCursor === "string"
+        ? data.olderCursor.trim() : "";
+      if (!this.isTrueFlag(data.hasOlder) || !nextCursor ||
+          nextCursor === cursor || !added) break;
+      cursor = nextCursor;
+    }
+  }
+
   async _legacyDetail(doc, html, base, target) {
     const metadata = {};
     const pairPattern = /<span[^>]*theme-detail-info-label[^>]*>\s*([^<]+)\s*<\/span>\s*<span[^>]*theme-detail-info-value[^>]*>([\s\S]*?)<\/span>/gi;
@@ -789,57 +868,7 @@ class DefaultExtension extends MProvider {
     const novelId = workId;
     const res = { body: html };
     const client = new Client({ timeout: 45 });
-    // The new site server-renders only the newest 100 episodes. Older
-    // episodes are exposed through a cursor API, so follow the same windows
-    // the website's "이전 회차 더 보기" button uses.
-    if (novelId && chapters.length > 0) {
-      const lastRow = doc.select(".novel-ep-row").slice(-1)[0];
-      const lastNumber = Number(lastRow?.attr("data-ep") || 0);
-      const lastId = String(lastRow?.attr("data-episode-id") || "");
-      let cursor = lastNumber > 0 && lastId ? `${lastNumber}:${lastId}` : null;
-      let hasOlder = Boolean(cursor) && /(?:\\"|")hasOlder(?:\\"|")\s*:\s*true/.test(res.body);
-      let windows = 0;
-
-      while (hasOlder && cursor && windows < 150) {
-        const apiUrl = `${base}/api/novel/${encodeURIComponent(novelId)}/episodes/window?direction=older&cursor=${encodeURIComponent(cursor)}`;
-        const windowRes = await client.get(apiUrl, {
-          ...this.getHeaders(apiUrl, target),
-          Accept: "application/json",
-          Referer: target
-        });
-        if (windowRes.statusCode !== 200) break;
-
-        let data;
-        try {
-          data = JSON.parse(windowRes.body);
-        } catch (_) {
-          break;
-        }
-        if (!data?.ok || !Array.isArray(data.items)) break;
-
-        for (const item of data.items) {
-          const episodeId = String(item?.id || "");
-          if (!episodeId || chapterIds.has(episodeId)) continue;
-          chapterIds.add(episodeId);
-          const number = this.cleanText(item.episodeLabel || (item.number ? `${item.number}\uD654` : "\uD68C\uCC28"));
-          const title = this.cleanText(item.title || "");
-          const markers = [
-            this.isTrueFlag(item.isNotReady) ? "\u23F3 \uC900\uBE44\uC911" : "",
-            this.isTrueFlag(item.isPaid) || this.isPaidGate(item.gateMode) ? "\uD83D\uDD12 \uC720\uB8CC" : ""
-          ].filter(Boolean).join(" ");
-          chapters.push({
-            name: `${markers ? markers + " \u00B7 " : ""}${title ? `${number} - ${title}` : number}`,
-            url: `${base}/novel/${novelId}/${episodeId}`,
-            dateUpload: this.parseDate(item.publishedAtLabel),
-            scanlator: null
-          });
-        }
-
-        hasOlder = this.isTrueFlag(data.hasOlder);
-        cursor = typeof data.olderCursor === "string" ? data.olderCursor : null;
-        windows += 1;
-      }
-    }
+    await this._appendOlderChapterWindows(doc, base, target, novelId, chapters, client);
 
     return { name, link: target, imageUrl, description, genre, author, artist: author, status, chapters };
   }
@@ -925,57 +954,7 @@ class DefaultExtension extends MProvider {
       });
     }
 
-    // The new site server-renders only the newest 100 episodes. Older
-    // episodes are exposed through a cursor API, so follow the same windows
-    // the website's "이전 회차 더 보기" button uses.
-    if (novelId && chapters.length > 0) {
-      const lastRow = doc.select(".novel-ep-row").slice(-1)[0];
-      const lastNumber = Number(lastRow?.attr("data-ep") || 0);
-      const lastId = String(lastRow?.attr("data-episode-id") || "");
-      let cursor = lastNumber > 0 && lastId ? `${lastNumber}:${lastId}` : null;
-      let hasOlder = Boolean(cursor) && /(?:\\"|")hasOlder(?:\\"|")\s*:\s*true/.test(res.body);
-      let windows = 0;
-
-      while (hasOlder && cursor && windows < 150) {
-        const apiUrl = `${base}/api/novel/${encodeURIComponent(novelId)}/episodes/window?direction=older&cursor=${encodeURIComponent(cursor)}`;
-        const windowRes = await client.get(apiUrl, {
-          ...this.getHeaders(apiUrl, target),
-          Accept: "application/json",
-          Referer: target
-        });
-        if (windowRes.statusCode !== 200) break;
-
-        let data;
-        try {
-          data = JSON.parse(windowRes.body);
-        } catch (_) {
-          break;
-        }
-        if (!data?.ok || !Array.isArray(data.items)) break;
-
-        for (const item of data.items) {
-          const episodeId = String(item?.id || "");
-          if (!episodeId || chapterIds.has(episodeId)) continue;
-          chapterIds.add(episodeId);
-          const number = this.cleanText(item.episodeLabel || (item.number ? `${item.number}\uD654` : "\uD68C\uCC28"));
-          const title = this.cleanText(item.title || "");
-          const markers = [
-            this.isTrueFlag(item.isNotReady) ? "\u23F3 \uC900\uBE44\uC911" : "",
-            this.isTrueFlag(item.isPaid) || this.isPaidGate(item.gateMode) ? "\uD83D\uDD12 \uC720\uB8CC" : ""
-          ].filter(Boolean).join(" ");
-          chapters.push({
-            name: `${markers ? markers + " \u00B7 " : ""}${title ? `${number} - ${title}` : number}`,
-            url: `${base}/novel/${novelId}/${episodeId}`,
-            dateUpload: this.parseDate(item.publishedAtLabel),
-            scanlator: null
-          });
-        }
-
-        hasOlder = this.isTrueFlag(data.hasOlder);
-        cursor = typeof data.olderCursor === "string" ? data.olderCursor : null;
-        windows += 1;
-      }
-    }
+    await this._appendOlderChapterWindows(doc, base, target, novelId, chapters, client);
 
     return {
       name,
