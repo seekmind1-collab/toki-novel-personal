@@ -1,19 +1,19 @@
 const mangayomiSources = [{
-  name: "\uD1A0\uB07C \uC18C\uC124 (\uAC1C\uC778)",
+  name: "\uD1A0\uB07C \uC18C\uC124",
   lang: "ko",
   baseUrl: "https://newtoki1.org",
   apiUrl: "",
   iconUrl: "https://dc-toki-mangayomi-novel.pages.dev/icon/ko.toki-novel.png",
   typeSource: "single",
   itemType: 2,
-  version: "0.3.0",
+  version: "0.3.1",
   dateFormat: "",
   dateFormatLocale: "ko_KR",
-  pkgPath: "novel/src/ko/toki_novel.js",
+  pkgPath: "novel/src/ko/toki31_novel.js",
   isNsfw: true,
   hasCloudflare: false,
   appMinVerReq: "0.9.2",
-  notes: "Personal newtoki1.org source. Manual domain is honored; traffic-light redirect disabled."
+  notes: "6\uC2DC\uAC04 \uC778\uAE30 \u00B7 \uCD5C\uC2E0/\uAC80\uC0C9/\uD544\uD130 \u00B7 \uC804\uCCB4 \uD68C\uCC28 \u00B7 \uD14D\uC2A4\uD2B8 \uBCF8\uBB38 \u00B7 \uC911\uC559\uC2E0\uD638\uB4F1"
 }];
 
 function dcResolveListCardManifest(data, scope, tab) {
@@ -81,7 +81,7 @@ class DefaultExtension extends MProvider {
     this.cardManifestUrl = this.assetBaseUrl + "/assets/official-random-cards.json";
     this.popularRulePreference = "toki_novel_popular_rule_v1";
     this.latestRulePreference = "toki_novel_latest_rule_v1";
-    this.domainPreference = "toki_personal_domain_url";
+    this.domainPreference = "toki_novel_domain_url_v2";
     this.customCardPreference = "toki_novel_custom_card_json_url_v2";
     this.domainCacheMs = 10 * 60 * 1000;
     this.pageSize = 49;
@@ -178,11 +178,11 @@ class DefaultExtension extends MProvider {
   }
 
   async _resolveBaseUrl() {
-    // Prefer the value saved by Mangayomi's source settings interface.
-    // SharedPreferences.getString() reads a different storage table.
-    // A blank/invalid manual value uses newtoki1.org, not the traffic light.
-    const manual = this._trimSlash(this._text(this._preference(this.domainPreference, "")));
-    return this._isHttpsOrigin(manual) ? manual : this.fallbackBaseUrl;
+    // Mangayomi source settings use SharedPreferences.get(), not getString().
+    const manual = this._trimSlash(this._preference(this.domainPreference, ""));
+    if (this._isHttpsOrigin(manual)) return manual;
+    // Keep the chosen base domain stable; old traffic-light entries are obsolete.
+    return this.fallbackBaseUrl;
   }
 
   absoluteUrl(base, url) {
@@ -323,18 +323,6 @@ class DefaultExtension extends MProvider {
   }
 
   async loadApiList(page, criteria, query) {
-    try {
-      return await this.loadLegacyList(page, criteria, query);
-    } catch (legacyError) {
-      try {
-        const result = await this.loadModernApiList(page, criteria, query);
-        if (result.list.length) return result;
-      } catch (_) {}
-      throw legacyError;
-    }
-  }
-
-  async loadModernApiList(page, criteria, query) {
     const base = await this._resolveBaseUrl();
     const current = Math.max(1, Number(page) || 1);
     const params = [
@@ -355,53 +343,6 @@ class DefaultExtension extends MProvider {
       list: novels.map((item) => this.novelFromApi(base, item)),
       hasNextPage: novels.length >= this.pageSize
     };
-  }
-
-  legacyListFromDocument(doc, base, page) {
-    const list = [];
-    const seen = new Set();
-    const rows = doc.select("#webtoon-list-all > li");
-    for (const row of rows) {
-      const name = this.cleanText(this.firstText(row, "span.title.white") || this.firstText(row, ".title.white"));
-      const linkNode = row.selectFirst(".img-item > a") || row.selectFirst("a[href*='/novel/']");
-      const rawLink = this._text(linkNode?.getHref || linkNode?.attr("href"));
-      if (!name || !/\/novel\/\d+/.test(rawLink)) continue;
-      const link = this.siteUrl(base, rawLink);
-      if (seen.has(link)) continue;
-      seen.add(link);
-      const cover = row.selectFirst("img.theme-thumb-img");
-      const coverPath = this._text(cover?.getSrc || cover?.attr("data-src") || cover?.attr("src"));
-      list.push({ name, link, imageUrl: coverPath ? this.absoluteUrl(base, coverPath) : this.generatedCover(name) });
-    }
-    // Also accept the newer card layout if the destination has switched themes.
-    if (!list.length) list.push(...this.listFromDocument(doc, base));
-    const explicitlyEmpty = this.hasElement(doc, ".list-wrap .wr-none");
-    if (!list.length && !explicitlyEmpty) {
-      throw new Error("NOVEL_LIST_STRUCTURE_MISSING: the HTML did not contain recognizable novel cards");
-    }
-    const nextPage = Math.max(1, Number(page) || 1) + 1;
-    const hasNextPage = doc.select(".pagination-desktop a, .pagination a").some((anchor) => {
-      const href = this._text(anchor.getHref || anchor.attr("href")).replace(/&amp;/g, "&");
-      return new RegExp("[?&]page=" + nextPage + "(?:&|$)").test(href);
-    });
-    return { list, hasNextPage: hasNextPage || list.length >= this.pageSize };
-  }
-
-  async loadLegacyList(page, criteria, query) {
-    const base = await this._resolveBaseUrl();
-    const selected = criteria || {};
-    const current = Math.max(1, Number(page) || 1);
-    const sortNames = { new: "as_update", fresh: "as_new", hot: "as_bookmark", views: "as_view", rating: "as_rating", episodes: "as_episode" };
-    const genres = { fantasy: "판타지", wuxia: "무협", adult19: "19금", modern: "현대", romance: "로맨스", romance_fantasy: "로맨스 판타지", bl: "BL", light_novel: "라노벨", etc: "기타" };
-    const params = ["kind=novel", "page=" + current, "pub=" + encodeURIComponent(query ? "all" : (selected.status || "ongoing")), "sod=desc", "sst=" + encodeURIComponent(sortNames[selected.sort] || "as_update")];
-    if (query) params.push("stx=" + encodeURIComponent(query));
-    else {
-      if (selected.genre) params.push("tag=" + encodeURIComponent(genres[selected.genre] || selected.genre));
-      if (selected.platform) params.push("plat=" + encodeURIComponent(selected.platform));
-    }
-    const target = base + "/novel?" + params.join("&");
-    const body = await this._requestText(target, base + "/novel", 30);
-    return this.legacyListFromDocument(new Document(body), base, current);
   }
 
   _driveDirect(url, image) {
@@ -639,19 +580,11 @@ class DefaultExtension extends MProvider {
   }
 
   async _rankList(page) {
-    try {
-      return await this.loadLegacyList(page, { status: "all", sort: "views" }, "");
-    } catch (legacyError) {
-      if (Number(page) > 1) throw legacyError;
-      try {
-        const base = await this._resolveBaseUrl();
-        const target = base + "/rank?kind=novel";
-        const body = await this._requestText(target, base + "/rank", 30);
-        const list = this.listFromRankDocument(new Document(body), base);
-        if (list.length) return { list, hasNextPage: false };
-      } catch (_) {}
-      throw legacyError;
-    }
+    if (Number(page) > 1) return { list: [], hasNextPage: false };
+    const base = await this._resolveBaseUrl();
+    const target = `${base}/rank?kind=novel`;
+    const body = await this._requestText(target, `${base}/rank`, 30);
+    return { list: this.listFromRankDocument(new Document(body), base), hasNextPage: false };
   }
 
   async _listForRule(page, rule) {
@@ -661,11 +594,11 @@ class DefaultExtension extends MProvider {
   }
 
   async getPopular(page) {
-    return this._listForRule(page, this._tabRule(this.popularRulePreference, this._defaultPopularRule()));
+    return this._prependCard(await this._listForRule(page, this._tabRule(this.popularRulePreference, this._defaultPopularRule())), page, "popular");
   }
 
   async getLatestUpdates(page) {
-    return this._listForRule(page, this._tabRule(this.latestRulePreference, this._defaultLatestRule()));
+    return this._prependCard(await this._listForRule(page, this._tabRule(this.latestRulePreference, this._defaultLatestRule())), page, "latest");
   }
 
   _filterValue(filters, type, fallback) {
@@ -704,76 +637,12 @@ class DefaultExtension extends MProvider {
   }
 
   parseDate(value) {
-    const match = String(value || "").match(/(\d{2,4})\.\s*(\d{1,2})\.\s*(\d{1,2})\.?/);
+    const match = String(value || "").match(/(\d{2,4})\.\s*(\d{1,2})\.\s*(\d{1,2})\./);
     if (!match) return null;
     let year = Number(match[1]);
     if (year < 100) year += 2000;
     const date = new Date(year, Number(match[2]) - 1, Number(match[3]));
     return String(date.valueOf());
-  }
-
-
-  _legacyDetail(doc, html, base, target) {
-    const metadata = {};
-    const pairPattern = /<span[^>]*theme-detail-info-label[^>]*>\s*([^<]+)\s*<\/span>\s*<span[^>]*theme-detail-info-value[^>]*>([\s\S]*?)<\/span>/gi;
-    let pair;
-    while ((pair = pairPattern.exec(this._text(html))) !== null) {
-      metadata[this.cleanText(pair[1])] = this.cleanText(pair[2].replace(/<[^>]*>/g, " "));
-    }
-    const meta = (property) => this._text(doc.selectFirst('meta[property="' + property + '"]')?.attr("content")).trim();
-    const name = this.cleanText(
-      this.firstText(doc, ".hero-v2-title") ||
-      this.firstText(doc, ".theme-detail-title-line") ||
-      this.firstText(doc, ".novel-detail .nd-info h1") ||
-      meta("og:title").replace(/\s+-\s+뉴토끼[\s\S]*$/i, "")
-    );
-    if (!name) throw new Error("NOVEL_DETAIL_TITLE_MISSING: detail HTML did not contain a recognizable novel title");
-    const author = this.cleanText(
-      this.firstText(doc, ".hero-v2-author a") ||
-      metadata["작가"] ||
-      this.firstText(doc, ".nd-meta span a")
-    );
-    const description = this.cleanText(
-      this.firstText(doc, ".hero-v2-desc") ||
-      this.firstText(doc, ".theme-detail-description") ||
-      this.firstText(doc, ".nd-desc") ||
-      meta("og:description")
-    );
-    const genre = doc.select(".hero-v2-tag").map((item) => this.cleanText(item.text)).filter(Boolean);
-    if (!genre.length && metadata["장르"]) genre.push(...metadata["장르"].split(/\s*,\s*/).filter(Boolean));
-    const coverNode = doc.selectFirst(".hero-v2-thumb img") || doc.selectFirst(".view-img img") || doc.selectFirst(".nd-thumb img");
-    const coverRaw = this._text(coverNode?.getSrc || coverNode?.attr("data-src") || coverNode?.attr("src") || meta("og:image"));
-    const imageUrl = coverRaw ? this.absoluteUrl(base, coverRaw) : this.generatedCover(name);
-    const statusText = this.firstText(doc, ".pill-status") || metadata["발행구분"] || "";
-    const status = /완결/.test(statusText) ? 1 : 0;
-    let rows = doc.select("#serial-move ul.list-body li.list-item");
-    if (!rows.length) rows = doc.select("ul.list-body li.list-item");
-    if (!rows.length) rows = doc.select(".novel-ep-row");
-    const chapters = [];
-    const seen = new Set();
-    const workId = this._text(target.match(/\/novel\/(\d+)/)?.[1]);
-    for (const row of rows) {
-      const anchor = row.selectFirst("a.item-subject") || row.selectFirst("a.novel-ep-link");
-      const rawLink = this._text(anchor?.getHref || anchor?.attr("href")).trim();
-      if (!rawLink) continue;
-      const url = this.siteUrl(base, rawLink);
-      const parts = url.match(/\/novel\/(\d+)\/(\d+)(?:[?#]|$)/);
-      if (!parts || (workId && parts[1] !== workId) || seen.has(url)) continue;
-      seen.add(url);
-      const title = this.cleanText(this.firstText(row, "a.item-subject") || this.firstText(row, ".ne-title"));
-      const chapterName = title || (this.cleanText(this.firstText(row, ".ne-num")) || "회차 " + parts[2]);
-      const paid = this.hasElement(row, ".ep-price-badge, .ep-badge-paid, .ne-unlock-cost") || this.isPaidGate(anchor?.attr("data-novel-episode-gate"));
-      chapters.push({
-        name: paid ? chapterName + " 🔒" : chapterName,
-        url,
-        dateUpload: this.parseDate(this.firstText(row, ".wr-date") || this.firstText(row, ".ne-date")),
-        scanlator: paid ? "🔒" : null
-      });
-    }
-    if (!chapters.length) {
-      throw new Error("NOVEL_DETAIL_CHAPTERS_MISSING: detail loaded, but no episode links matched the page layout");
-    }
-    return { name, link: target, imageUrl, description, genre, author, artist: author, status, chapters };
   }
 
   async getDetail(url) {
@@ -818,7 +687,6 @@ class DefaultExtension extends MProvider {
     const res = await client.get(target, this.getHeaders(target, `${base}/novel`));
     const doc = new Document(res.body);
     const root = doc.selectFirst(".novel-detail");
-    if (!root || !this.firstText(root, ".nd-info h1")) return this._legacyDetail(doc, res.body, base, target);
     const name = this.firstText(root, ".nd-info h1");
     const description = this.firstText(root, ".nd-desc");
     const author = this.firstText(root, ".nd-meta span a");
@@ -1174,7 +1042,7 @@ class DefaultExtension extends MProvider {
         key: this.domainPreference,
         editTextPreference: {
           title: "\uD1A0\uB07C \uC8FC\uC18C \uC9C1\uC811 \uC9C0\uC815 (\uC120\uD0DD)",
-          summary: "비워두면 https://newtoki1.org 주소를 사용합니다. 직접 입력한 주소가 유효하면 그 주소를 사용합니다.",
+          summary: "\uBE48 \uAC12\uC774\uBA74 \uD1A0\uB07C \uC911\uC559\uC2E0\uD638\uB4F1\uC758 \uCD5C\uC2E0 \uC8FC\uC18C\uB97C \uC790\uB3D9\uC73C\uB85C \uC0AC\uC6A9\uD569\uB2C8\uB2E4.",
           value: "",
           dialogTitle: "\uD1A0\uB07C \uC18C\uC124 \uC8FC\uC18C",
           dialogMessage: "https://\uB85C \uC2DC\uC791\uD558\uB294 \uC0AC\uC774\uD2B8 \uC8FC\uC18C\uB97C \uC785\uB825\uD558\uC138\uC694. \uC790\uB3D9 \uC8FC\uC18C\uB97C \uC4F0\uB824\uBA74 \uBE44\uC6CC \uB450\uC138\uC694."
