@@ -6,7 +6,7 @@ const mangayomiSources = [{
   iconUrl: "https://dc-toki-mangayomi-novel.pages.dev/icon/ko.toki-novel.png",
   typeSource: "single",
   itemType: 2,
-  version: "0.3.4",
+  version: "0.3.5",
   dateFormat: "",
   dateFormatLocale: "ko_KR",
   pkgPath: "novel/src/ko/toki31_novel.js",
@@ -722,37 +722,51 @@ class DefaultExtension extends MProvider {
   }
 
   async _appendOlderChapterWindows(doc, base, target, novelId, chapters, client) {
-    // The page commonly renders only the newest 100 chapters.
-    // Determine the cursor from the final server-rendered episode row.
-    // Do not gate the initial request on a literal "hasOlder" in the HTML:
-    // that marker is optional and can be encoded differently.
-    const rows = doc.select(".novel-ep-row");
+    // Both detail templates can contain only the latest episode window.
+    // Pick the oldest numbered episode visible in either template.
+    let rows = doc.select(".novel-ep-row");
+    if (!rows.length) rows = doc.select("#serial-move ul.list-body li.list-item");
+    if (!rows.length) rows = doc.select("ul.list-body li.list-item");
     if (!novelId || !chapters.length || !rows.length) return;
 
-    const last = rows[rows.length - 1];
-    const epLabel = this._text(last?.attr("data-ep")) ||
-      this.cleanText(this.firstText(last, ".ne-num"));
-    const epMatch = epLabel.match(/\d+/);
-    const episodeNumber = epMatch ? Number(epMatch[0]) : 0;
-    let episodeId = this._text(last?.attr("data-episode-id")).trim();
-    if (!episodeId) {
-      const anchor = last?.selectFirst("a.novel-ep-link");
-      const href = this._text(anchor?.getHref || anchor?.attr("href"));
-      const match = href.match(/\/novel\/(\d+)\/(\d+)(?:[?#]|$)/);
-      if (match && match[1] === String(novelId)) episodeId = match[2];
+    let oldest = null;
+    for (const row of rows) {
+      const anchor = row.selectFirst("a.novel-ep-link") ||
+        row.selectFirst("a.item-subject");
+      const href = this._text(anchor?.getHref || anchor?.attr("href")).trim();
+      const idMatch = href.match(/\/novel\/(\d+)\/(\d+)(?:[?#]|$)/);
+      const episodeId = this._text(row.attr("data-episode-id") ||
+        (idMatch && idMatch[1] === String(novelId) ? idMatch[2] : "")).trim();
+      if (!/^\d+$/.test(episodeId)) continue;
+
+      const dataNumber = this._text(row.attr("data-ep")).trim();
+      const numberText = this.cleanText(
+        this.firstText(row, ".ne-num") ||
+        this.firstText(row, "a.item-subject") ||
+        this.firstText(row, ".ne-title") ||
+        row.text
+      );
+      const labelMatch = numberText.match(/(?:제\s*)?(\d{1,7})\s*(?:화|회차|회)(?!\d)/);
+      const episodeNumber = /^\d+$/.test(dataNumber)
+        ? Number(dataNumber) : (labelMatch ? Number(labelMatch[1]) : 0);
+      if (!Number.isSafeInteger(episodeNumber) || episodeNumber < 1) continue;
+
+      if (!oldest || episodeNumber < oldest.number) {
+        oldest = { number: episodeNumber, id: episodeId };
+      }
     }
-    if (!Number.isSafeInteger(episodeNumber) || episodeNumber < 1 ||
-        !/^\d+$/.test(episodeId)) return;
+    if (!oldest) return;
 
     const knownEpisodeIds = new Set();
     for (const chapter of chapters) {
-      const match = this._text(chapter.url || chapter.link).match(/\/novel\/(\d+)\/(\d+)(?:[?#]|$)/);
+      const match = this._text(chapter.url || chapter.link)
+        .match(/\/novel\/(\d+)\/(\d+)(?:[?#]|$)/);
       if (match && match[1] === String(novelId)) knownEpisodeIds.add(match[2]);
     }
 
-    let cursor = episodeNumber + ":" + episodeId;
+    let cursor = oldest.number + ":" + oldest.id;
     const requestedCursors = new Set();
-    for (let windowCount = 0; windowCount < 150; windowCount += 1) {
+    for (let windowCount = 0; windowCount < 150; windowCount++) {
       if (requestedCursors.has(cursor)) break;
       requestedCursors.add(cursor);
       const apiUrl = base + "/api/novel/" + encodeURIComponent(novelId) +
