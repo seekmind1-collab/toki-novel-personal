@@ -6,7 +6,7 @@ const mangayomiSources = [{
   iconUrl: "https://dc-toki-mangayomi-novel.pages.dev/icon/ko.toki-novel.png",
   typeSource: "single",
   itemType: 2,
-  version: "0.2.9",
+  version: "0.3.0",
   dateFormat: "",
   dateFormatLocale: "ko_KR",
   pkgPath: "novel/src/ko/toki_novel.js",
@@ -704,12 +704,76 @@ class DefaultExtension extends MProvider {
   }
 
   parseDate(value) {
-    const match = String(value || "").match(/(\d{2,4})\.\s*(\d{1,2})\.\s*(\d{1,2})\./);
+    const match = String(value || "").match(/(\d{2,4})\.\s*(\d{1,2})\.\s*(\d{1,2})\.?/);
     if (!match) return null;
     let year = Number(match[1]);
     if (year < 100) year += 2000;
     const date = new Date(year, Number(match[2]) - 1, Number(match[3]));
     return String(date.valueOf());
+  }
+
+
+  _legacyDetail(doc, html, base, target) {
+    const metadata = {};
+    const pairPattern = /<span[^>]*theme-detail-info-label[^>]*>\s*([^<]+)\s*<\/span>\s*<span[^>]*theme-detail-info-value[^>]*>([\s\S]*?)<\/span>/gi;
+    let pair;
+    while ((pair = pairPattern.exec(this._text(html))) !== null) {
+      metadata[this.cleanText(pair[1])] = this.cleanText(pair[2].replace(/<[^>]*>/g, " "));
+    }
+    const meta = (property) => this._text(doc.selectFirst('meta[property="' + property + '"]')?.attr("content")).trim();
+    const name = this.cleanText(
+      this.firstText(doc, ".hero-v2-title") ||
+      this.firstText(doc, ".theme-detail-title-line") ||
+      this.firstText(doc, ".novel-detail .nd-info h1") ||
+      meta("og:title").replace(/\s+-\s+뉴토끼[\s\S]*$/i, "")
+    );
+    if (!name) throw new Error("NOVEL_DETAIL_TITLE_MISSING: detail HTML did not contain a recognizable novel title");
+    const author = this.cleanText(
+      this.firstText(doc, ".hero-v2-author a") ||
+      metadata["작가"] ||
+      this.firstText(doc, ".nd-meta span a")
+    );
+    const description = this.cleanText(
+      this.firstText(doc, ".hero-v2-desc") ||
+      this.firstText(doc, ".theme-detail-description") ||
+      this.firstText(doc, ".nd-desc") ||
+      meta("og:description")
+    );
+    const genre = doc.select(".hero-v2-tag").map((item) => this.cleanText(item.text)).filter(Boolean);
+    if (!genre.length && metadata["장르"]) genre.push(...metadata["장르"].split(/\s*,\s*/).filter(Boolean));
+    const coverNode = doc.selectFirst(".hero-v2-thumb img") || doc.selectFirst(".view-img img") || doc.selectFirst(".nd-thumb img");
+    const coverRaw = this._text(coverNode?.getSrc || coverNode?.attr("data-src") || coverNode?.attr("src") || meta("og:image"));
+    const imageUrl = coverRaw ? this.absoluteUrl(base, coverRaw) : this.generatedCover(name);
+    const statusText = this.firstText(doc, ".pill-status") || metadata["발행구분"] || "";
+    const status = /완결/.test(statusText) ? 1 : 0;
+    let rows = doc.select("#serial-move ul.list-body li.list-item");
+    if (!rows.length) rows = doc.select("ul.list-body li.list-item");
+    if (!rows.length) rows = doc.select(".novel-ep-row");
+    const chapters = [];
+    const seen = new Set();
+    const workId = this._text(target.match(/\/novel\/(\d+)/)?.[1]);
+    for (const row of rows) {
+      const anchor = row.selectFirst("a.item-subject") || row.selectFirst("a.novel-ep-link");
+      const rawLink = this._text(anchor?.getHref || anchor?.attr("href")).trim();
+      if (!rawLink) continue;
+      const url = this.siteUrl(base, rawLink);
+      const parts = url.match(/\/novel\/(\d+)\/(\d+)(?:[?#]|$)/);
+      if (!parts || (workId && parts[1] !== workId) || seen.has(url)) continue;
+      seen.add(url);
+      const title = this.cleanText(this.firstText(row, "a.item-subject") || this.firstText(row, ".ne-title"));
+      const chapterName = title || (this.cleanText(this.firstText(row, ".ne-num")) || "회차 " + parts[2]);
+      const paid = this.hasElement(row, ".ep-price-badge, .ep-badge-paid, .ne-unlock-cost") || this.isPaidGate(anchor?.attr("data-novel-episode-gate"));
+      chapters.push({
+        name: paid ? chapterName + " 🔒" : chapterName,
+        url,
+        dateUpload: this.parseDate(this.firstText(row, ".wr-date") || this.firstText(row, ".ne-date")),
+        scanlator: paid ? "🔒" : null
+      });
+    }
+    if (!chapters.length) {
+      throw new Error("NOVEL_DETAIL_CHAPTERS_MISSING: detail loaded, but no episode links matched the page layout");
+    }
+    return { name, link: target, imageUrl, description, genre, author, artist: author, status, chapters };
   }
 
   async getDetail(url) {
@@ -754,6 +818,7 @@ class DefaultExtension extends MProvider {
     const res = await client.get(target, this.getHeaders(target, `${base}/novel`));
     const doc = new Document(res.body);
     const root = doc.selectFirst(".novel-detail");
+    if (!root || !this.firstText(root, ".nd-info h1")) return this._legacyDetail(doc, res.body, base, target);
     const name = this.firstText(root, ".nd-info h1");
     const description = this.firstText(root, ".nd-desc");
     const author = this.firstText(root, ".nd-meta span a");
